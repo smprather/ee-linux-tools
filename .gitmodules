@@ -1,0 +1,4 @@
+[submodule "external/neovim"]
+	path = external/neovim
+	url = https://github.com/neovim/neovim
+	branch = master
