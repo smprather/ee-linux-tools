@@ -1,5 +1,8 @@
 # ee-linux-tools
-Linux tools compiled to common EDA linux distro targets (EL7/8+). Configured to work offline when applicable.
+* Linux tools compiled to common EDA linux distro targets (EL7/8+). Configured to work offline when applicable.
+* Wrappers to detect platform and auto-route to the correct binaries.
+* Hopefully PatchELF'd to auto-work with the .so's included
+  * May need to hard-code some paths to dynamic linker interpretter as a post-install step. We'll see...
 
 # Architectures
 * x86_64
@@ -29,5 +32,6 @@ Linux tools compiled to common EDA linux distro targets (EL7/8+). Configured to 
 | [bash](https://github.com/bminor/bash) | Latest version. |
 | [zsh](https://github.com/zsh-users/zsh) | Bash alternative. |
 | [ohmyzsh](https://github.com/ohmyzsh/ohmyzsh) | Zsh configuration manager. |
+| [patchelf](https://github.com/NixOS/patchelf) | Linux binary editor to help with dynamic linking. |
 | Much more... | Much much more..... |
 
