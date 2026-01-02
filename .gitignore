@@ -1,6 +1,7 @@
-external/
-
 # Byte-compiled / optimized / DLL files
+external/
+deploy/
+
 __pycache__/
 *.py[codz]
 *$py.class
