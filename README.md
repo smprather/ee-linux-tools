@@ -33,5 +33,6 @@
 | [zsh](https://github.com/zsh-users/zsh) | Bash alternative. |
 | [ohmyzsh](https://github.com/ohmyzsh/ohmyzsh) | Zsh configuration manager. |
 | [patchelf](https://github.com/NixOS/patchelf) | Linux binary editor to help with dynamic linking. |
+| [stylua](https://github.com/JohnnyMorganz/StyLua) | Lua formatter written in Rust. |
 | Much more... | Much much more..... |
 
