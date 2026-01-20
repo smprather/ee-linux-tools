@@ -4,7 +4,8 @@ Install invoke with: pip install invoke
 """
 
 import os
-from datetime import datetime
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from invoke import task
@@ -12,6 +13,11 @@ from invoke import task
 # Configuration
 BUILD_DIR = "build"
 TEST_DIR = "test"
+
+
+@task
+def create_cache_volume(c):
+    c.run("docker volume create build-cache")
 
 
 def get_docker_image_creation_time(c, image_name):
@@ -28,8 +34,9 @@ def get_docker_image_creation_time(c, image_name):
 
 def get_file_modification_time(filepath):
     """Get the modification timestamp of a file"""
-    if os.path.exists(filepath):
-        return datetime.fromtimestamp(os.path.getmtime(filepath))
+    path = Path(filepath)
+    if path.exists():
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
     return None
 
 
@@ -40,7 +47,8 @@ def should_rebuild_docker_image(c, image_name, dockerfile_path, force=False):
         return True
 
     # Check if Dockerfile exists
-    if not os.path.exists(dockerfile_path):
+    dockerfile = Path(dockerfile_path)
+    if not dockerfile.exists():
         print(f"Error: {dockerfile_path} not found!")
         return False
 
@@ -68,23 +76,24 @@ def should_rebuild_docker_image(c, image_name, dockerfile_path, force=False):
 
 def get_available_platforms(base_dir):
     """Get list of available platform directories"""
-    if not os.path.exists(base_dir):
+    base_path = Path(base_dir)
+    if not base_path.exists():
         return []
-    return [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+    return [d.name for d in base_path.iterdir() if d.is_dir()]
 
 
 def get_tools_for_platform(platform, base_dir, script_prefix):
     """Get list of available tools for a platform by scanning for build/test scripts"""
-    platform_dir = os.path.join(base_dir, platform)
-    if not os.path.exists(platform_dir):
+    platform_dir = Path(base_dir) / platform
+    if not platform_dir.exists():
         return []
 
     tools = []
-    for filename in os.listdir(platform_dir):
-        if filename.startswith(script_prefix) and filename.endswith(".sh"):
+    for script in platform_dir.iterdir():
+        if script.name.startswith(script_prefix) and script.name.endswith(".sh"):
             # Extract tool name from script filename
             # e.g., "build_neovim.sh" -> "neovim"
-            tool_name = filename[len(script_prefix) : -3]
+            tool_name = script.name[len(script_prefix) : -3]
             tools.append(tool_name)
 
     return sorted(tools)
@@ -141,26 +150,84 @@ def validate_platforms(platforms_str, base_dir):
 
 def build_docker_image_for_platform(c, platform, base_dir, force=False):
     """Build Docker image for a specific platform if needed"""
-    dockerfile_path = os.path.join(base_dir, platform, "Dockerfile")
+    platform_dir = Path(base_dir) / platform
+    dockerfile_path = platform_dir / "Dockerfile"
     image_name = f"builder-{platform.lower()}"
 
     if should_rebuild_docker_image(c, image_name, dockerfile_path, force):
         print(f"\nBuilding Docker image for platform: {platform}")
         print(f"Dockerfile: {dockerfile_path}")
         c.run(
-            f"docker build -t {image_name} -f {dockerfile_path} {os.path.join(base_dir, platform)}"
+            f"docker build -t {image_name} -f {dockerfile_path} {platform_dir}",
+            pty=True,
+            echo=True,
         )
         print(f"Docker image '{image_name}' build complete!\n")
 
     return image_name
 
 
+@task
+def update_repos(c):
+    """Clone or update tool repositories from tool_repos.yaml"""
+    import yaml
+
+    repos_dir = Path("tool_repos")
+    repos_file = Path("tool_repos.yaml")
+
+    # Check if tool_repos.yaml exists
+    if not repos_file.exists():
+        print(f"Error: {repos_file} not found!")
+        return
+
+    # Create tool_repos directory if it doesn't exist
+    repos_dir.mkdir(exist_ok=True)
+    print(f"Using repository directory: {repos_dir.absolute()}")
+
+    # Read tool_repos.yaml
+    with repos_file.open() as f:
+        repos = yaml.safe_load(f)
+
+    if not repos:
+        print("No repositories defined in tool_repos.yaml")
+        return
+
+    print(f"Found {len(repos)} repository/repositories to process\n")
+
+    # Clone or update each repository
+    for tool_name, repo_info in repos.items():
+        url = repo_info.get("url")
+        branch = repo_info.get("branch", "main")
+
+        if not url:
+            print(f"Warning: No URL specified for {tool_name}, skipping")
+            continue
+
+        tool_path = repos_dir / tool_name
+
+        if tool_path.exists():
+            print(f"{'-' * 70}")
+            print(f"Updating {tool_name}...")
+            print(f"{'-' * 70}")
+            c.run(f"cd {tool_path} && git pull", pty=True)
+        else:
+            print(f"{'-' * 70}")
+            print(f"Cloning {tool_name} from {url} (branch: {branch})...")
+            print(f"{'-' * 70}")
+            c.run(f"git clone -b {branch} {url} {tool_path}", pty=True)
+
+        print()
+
+    print("Repository updates complete!")
+
+
 @task(
+    pre=[create_cache_volume, update_repos],
     help={
         "tools": "Comma-separated list of tools to build (e.g., neovim). Default: all tools for each platform",
         "platforms": "Comma-separated list of platforms (e.g., GLIBC227,EL7). Default: all platforms",
         "force_image_rebuild": "Force rebuild of Docker images",
-    }
+    },
 )
 def build(c, tools=None, platforms=None, force_image_rebuild=False):
     """Build specified tools for specified platforms"""
@@ -208,14 +275,19 @@ def build(c, tools=None, platforms=None, force_image_rebuild=False):
             print(f"{'-' * 70}\n")
 
             # Run build in Docker container
-            platform_dir = os.path.join(BUILD_DIR, platform)
+            platform_dir = Path(BUILD_DIR) / platform
             c.run(
                 f"docker run --rm "
+                f"--cpus {subprocess.getoutput('cat /proc/cpuinfo | grep -c Processor')} "
+                "-v build-cache:/cache "
+                f"-v {Path.cwd()}/tool_repos:/tool_repos "
+                f"-v {Path.cwd()}/deploy:/deploy "
                 f"-v $(pwd)/{platform_dir}:/workspace "
                 f"-w /workspace "
                 f"{image_name} "
                 f"/workspace/build_{tool}.sh",
                 pty=True,
+                echo=True,
             )
 
             print(f"\n{tool} build complete for {platform}!")
@@ -226,10 +298,9 @@ def build(c, tools=None, platforms=None, force_image_rebuild=False):
         "tools": "Comma-separated list of tools to test (e.g., neovim). Default: all tools for each platform",
         "platforms": "Comma-separated list of platforms (e.g., EL7). Default: all platforms",
         "force_image_rebuild": "Force rebuild of Docker images",
-        "debug": "Run in interactive debug mode with debug.sh script",
     }
 )
-def test(c, tools=None, platforms=None, force_image_rebuild=False, debug=False):
+def test(c, tools=None, platforms=None, force_image_rebuild=False):
     """Run tests for specified tools on specified platforms"""
 
     # Get platforms - default to all if not specified
@@ -246,13 +317,6 @@ def test(c, tools=None, platforms=None, force_image_rebuild=False, debug=False):
         if platform_list is None:
             return
 
-    # In debug mode, only support one platform
-    if debug:
-        if len(platform_list) > 1:
-            print("Debug mode supports only one platform at a time.")
-            print(f"Using first platform: {platform_list[0]}")
-            platform_list = platform_list[:1]
-
     # Test for each platform and tool combination
     for platform in platform_list:
         print(f"\n{'=' * 70}")
@@ -260,93 +324,95 @@ def test(c, tools=None, platforms=None, force_image_rebuild=False, debug=False):
         print(f"{'=' * 70}")
 
         # Get tools for this platform - default to all if not specified
-        if debug:
-            # In debug mode, we don't need a tool list
-            tool_list = []
-        else:
-            tool_list = validate_tools(tools, platform, TEST_DIR, "test_")
-            if tool_list is None:
-                continue
+        tool_list = validate_tools(tools, platform, TEST_DIR, "test_")
+        if tool_list is None:
+            continue
 
-            if not tool_list:
-                print(f"No test scripts found for platform {platform}. Skipping.")
-                continue
+        if not tool_list:
+            print(f"No test scripts found for platform {platform}. Skipping.")
+            continue
 
-            if not tools:
-                print(f"Testing all tools for {platform}: {', '.join(tool_list)}")
+        if not tools:
+            print(f"Testing all tools for {platform}: {', '.join(tool_list)}")
 
         # Build Docker image for this platform
         image_name = build_docker_image_for_platform(
             c, platform, TEST_DIR, force_image_rebuild
         )
 
-        if debug:
+        for tool in tool_list:
             print(f"\n{'-' * 70}")
-            print(f"Starting debug session on {platform}...")
+            print(f"Testing {tool} on {platform}...")
             print(f"{'-' * 70}\n")
 
-            # Run debug script in interactive mode
-            platform_dir = os.path.join(TEST_DIR, platform)
+            # Run tests in Docker container
+            platform_dir = Path(TEST_DIR) / platform
             c.run(
-                f"docker run --rm -it "
+                f"docker run --rm "
+                f"-v {Path.cwd()}/tool_repos:/tool_repos "
+                f"-v {Path.cwd()}/deploy:/deploy "
                 f"-v $(pwd)/{platform_dir}:/workspace "
                 f"-w /workspace "
                 f"{image_name} "
-                f"/workspace/debug.sh",
+                f"/workspace/test_{tool}.sh",
                 pty=True,
+                echo=True,
             )
-        else:
-            for tool in tool_list:
-                print(f"\n{'-' * 70}")
-                print(f"Testing {tool} on {platform}...")
-                print(f"{'-' * 70}\n")
 
-                # Run tests in Docker container
-                platform_dir = os.path.join(TEST_DIR, platform)
-                c.run(
-                    f"docker run --rm "
-                    f"-v $(pwd)/{platform_dir}:/workspace "
-                    f"-w /workspace "
-                    f"{image_name} "
-                    f"/workspace/test_{tool}.sh",
-                    pty=True,
-                )
-
-                print(f"\n{tool} tests complete for {platform}!")
+            print(f"\n{tool} tests complete for {platform}!")
 
 
 @task(
     help={
-        "tools": "Tool to debug (only one supported)",
-        "platforms": "Platform to debug on (only one supported)",
+        "platform": "Platform to debug (optional - will prompt if not provided)",
         "force_image_rebuild": "Force rebuild of Docker image",
     }
 )
-def debug(c, tools=None, platforms=None, force_image_rebuild=False):
-    """Launch interactive debug session for specified tool and platform"""
+def debug_build(c, platform=None, force_image_rebuild=False):
+    """Launch interactive debug session for a build platform"""
 
-    # Get platforms
-    if not platforms:
+    # If platform not provided, prompt user to choose
+    if not platform:
         available = get_available_platforms(BUILD_DIR)
         if not available:
             print(f"Error: No platform directories found in {BUILD_DIR}/")
             return
-        print(f"No platforms specified. Available: {', '.join(available)}")
-        return
 
-    platform_list = validate_platforms(platforms, BUILD_DIR)
+        print(f"Available platforms: {', '.join(available)}")
+
+        # Create a simple interactive prompt
+        print("\nSelect a platform:")
+        for i, p in enumerate(available, 1):
+            print(f"  {i}. {p}")
+
+        try:
+            choice = input("\nEnter platform number or name: ").strip()
+
+            # Check if it's a number
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(available):
+                    platform = available[idx]
+                else:
+                    print(f"Error: Invalid selection {choice}")
+                    return
+            elif choice in available:
+                platform = choice
+            else:
+                print(f"Error: Invalid platform '{choice}'")
+                return
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled")
+            return
+
+    platform_list = validate_platforms(platform, BUILD_DIR)
     if platform_list is None:
         return
-
-    if len(platform_list) > 1:
-        print("Debug mode supports only one platform at a time.")
-        print(f"Using first platform: {platform_list[0]}")
-        platform_list = platform_list[:1]
 
     platform = platform_list[0]
 
     print(f"\n{'=' * 70}")
-    print(f"Starting debug session on {platform}...")
+    print(f"Starting debug session on build platform: {platform}...")
     print(f"{'=' * 70}\n")
 
     # Build Docker image for this platform
@@ -355,15 +421,104 @@ def debug(c, tools=None, platforms=None, force_image_rebuild=False):
     )
 
     # Launch interactive shell in Docker container
-    platform_dir = os.path.join(BUILD_DIR, platform)
-    c.run(
-        f"docker run --rm -it "
-        f"-v $(pwd)/{platform_dir}:/workspace "
-        f"-w /workspace "
-        f"{image_name} "
-        f"/bin/bash",
-        pty=True,
+    platform_dir = Path(BUILD_DIR) / platform
+    cwd = Path.cwd()
+
+    # Build docker command as list for exec
+    docker_cmd = [
+        "docker", "run", "--rm", "-it",
+        "-v", "build-cache:/cache",
+        "-v", f"{cwd}/tool_repos:/tool_repos",
+        "-v", f"{cwd}/deploy:/deploy",
+        "-v", f"{cwd}/{platform_dir}:/workspace",
+        "-w", "/workspace",
+        image_name,
+        "/bin/bash"
+    ]
+
+    print(f"Executing: {' '.join(docker_cmd)}")
+
+    # Replace current process with docker
+    os.execvp("docker", docker_cmd)
+
+
+@task(
+    help={
+        "platform": "Platform to debug (optional - will prompt if not provided)",
+        "force_image_rebuild": "Force rebuild of Docker image",
+    }
+)
+def debug_test(c, platform=None, force_image_rebuild=False):
+    """Launch interactive debug session for a test platform"""
+
+    # If platform not provided, prompt user to choose
+    if not platform:
+        available = get_available_platforms(TEST_DIR)
+        if not available:
+            print(f"Error: No platform directories found in {TEST_DIR}/")
+            return
+
+        print(f"Available platforms: {', '.join(available)}")
+
+        # Create a simple interactive prompt
+        print("\nSelect a platform:")
+        for i, p in enumerate(available, 1):
+            print(f"  {i}. {p}")
+
+        try:
+            choice = input("\nEnter platform number or name: ").strip()
+
+            # Check if it's a number
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(available):
+                    platform = available[idx]
+                else:
+                    print(f"Error: Invalid selection {choice}")
+                    return
+            elif choice in available:
+                platform = choice
+            else:
+                print(f"Error: Invalid platform '{choice}'")
+                return
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled")
+            return
+
+    platform_list = validate_platforms(platform, TEST_DIR)
+    if platform_list is None:
+        return
+
+    platform = platform_list[0]
+
+    print(f"\n{'=' * 70}")
+    print(f"Starting debug session on test platform: {platform}...")
+    print(f"{'=' * 70}\n")
+
+    # Build Docker image for this platform
+    image_name = build_docker_image_for_platform(
+        c, platform, TEST_DIR, force_image_rebuild
     )
+
+    # Launch interactive shell in Docker container
+    platform_dir = Path(TEST_DIR) / platform
+    cwd = Path.cwd()
+
+    # Build docker command as list for exec
+    docker_cmd = [
+        "docker", "run", "--rm", "-it",
+        "-v", f"{cwd}/tool_repos:/tool_repos",
+        "-v", f"{cwd}/deploy:/deploy",
+        "-v", f"{cwd}/{platform_dir}:/workspace",
+        "-w", "/workspace",
+        image_name,
+        "/bin/bash"
+    ]
+
+    print(f"Executing: {' '.join(docker_cmd)}")
+
+    # Replace current process with docker
+    os.execvp("docker", docker_cmd)
 
 
 @task
@@ -372,9 +527,9 @@ def clean(c):
     print("Cleaning build artifacts...")
 
     for platform in get_available_platforms(BUILD_DIR):
-        platform_dir = os.path.join(BUILD_DIR, platform)
-        artifacts_dir = os.path.join(platform_dir, "artifacts")
-        if os.path.exists(artifacts_dir):
+        platform_dir = Path(BUILD_DIR) / platform
+        artifacts_dir = platform_dir / "artifacts"
+        if artifacts_dir.exists():
             print(f"  Cleaning {artifacts_dir}")
             c.run(f"rm -rf {artifacts_dir}/*")
 

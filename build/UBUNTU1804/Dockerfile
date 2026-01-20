@@ -1,6 +1,8 @@
 # GLIBC 2.27
 FROM ubuntu:18.04
 
+ENV PLATFORM=UBUNTU1804
+
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \

@@ -1,8 +1,8 @@
 # ee-linux-tools
 * Linux tools compiled to common EDA linux distro targets (EL7/8+). Configured to work offline when applicable.
 * Wrappers to detect platform and auto-route to the correct binaries.
-* Hopefully PatchELF'd to auto-work with the .so's included
-  * May need to hard-code some paths to dynamic linker interpretter as a post-install step. We'll see...
+* All so files needed are copied to the platform lib/ directory
+  * Wrapper script sets up LD_LIBRARY_PATH as needed.
 
 # Architectures
 * x86_64

@@ -2,6 +2,7 @@
 external/
 deploy/
 .venv/
+tool_repos/
 
 __pycache__/
 *.py[codz]
