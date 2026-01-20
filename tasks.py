@@ -4,15 +4,60 @@ Install invoke with: pip install invoke
 """
 
 import os
+import re
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
 from invoke import task
 
+tasks_file_path = Path(__file__).resolve().parent
+print(f"Changing directory to {tasks_file_path}")
+os.chdir(tasks_file_path)
+
 # Configuration
-BUILD_DIR = "build"
-TEST_DIR = "test"
+BUILD_DIR = Path("build")
+TEST_DIR = Path("test")
+DIST_DIR = Path("dist")
+
+
+def generate_wrapper_script(exe_name):
+    """Generate platform-detection wrapper script"""
+    return f"""#!/bin/bash
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+DIST_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Platform detection loop
+for platform_dir in "$DIST_ROOT"/*; do
+    if [[ -d "$platform_dir" && -f "$platform_dir/detect_platform.sh" ]]; then
+        platform_name=$(basename "$platform_dir")
+
+        # Skip the bin directory itself
+        if [[ "$platform_name" == "bin" ]]; then
+            continue
+        fi
+
+        # Source the detect script to check if it matches
+        if (cd "$platform_dir" && source detect_platform.sh); then
+            # Platform match found!
+            export LD_LIBRARY_PATH="$platform_dir/lib:$LD_LIBRARY_PATH"
+            exec "$platform_dir/bin/{exe_name}" "$@"
+        fi
+    fi
+done
+
+# No platform matched
+echo "Error: No compatible platform found for this system" >&2
+echo "Available platforms:" >&2
+for platform_dir in "$DIST_ROOT"/*; do
+    [[ -d "$platform_dir" && "$platform_dir" != */bin ]] && echo "  - $(basename "$platform_dir")" >&2
+done
+exit 1
+"""
 
 
 @task
@@ -74,7 +119,7 @@ def should_rebuild_docker_image(c, image_name, dockerfile_path, force=False):
     return False
 
 
-def get_available_platforms(base_dir):
+def get_available_platforms(base_dir: Path) -> list[str]:
     """Get list of available platform directories"""
     base_path = Path(base_dir)
     if not base_path.exists():
@@ -148,11 +193,13 @@ def validate_platforms(platforms_str, base_dir):
     return platforms
 
 
-def build_docker_image_for_platform(c, platform, base_dir, force=False):
+def build_docker_image_for_platform(
+    c, platform, base_dir, force=False, image_prefix="builder"
+):
     """Build Docker image for a specific platform if needed"""
     platform_dir = Path(base_dir) / platform
     dockerfile_path = platform_dir / "Dockerfile"
-    image_name = f"builder-{platform.lower()}"
+    image_name = f"{image_prefix}-{platform.lower()}"
 
     if should_rebuild_docker_image(c, image_name, dockerfile_path, force):
         print(f"\nBuilding Docker image for platform: {platform}")
@@ -170,8 +217,6 @@ def build_docker_image_for_platform(c, platform, base_dir, force=False):
 @task
 def update_repos(c):
     """Clone or update tool repositories from tool_repos.yaml"""
-    import yaml
-
     repos_dir = Path("tool_repos")
     repos_file = Path("tool_repos.yaml")
 
@@ -275,7 +320,7 @@ def build(c, tools=None, platforms=None, force_image_rebuild=False):
             print(f"{'-' * 70}\n")
 
             # Run build in Docker container
-            platform_dir = Path(BUILD_DIR) / platform
+            platform_dir = BUILD_DIR / platform
             c.run(
                 f"docker run --rm "
                 f"--cpus {subprocess.getoutput('cat /proc/cpuinfo | grep -c Processor')} "
@@ -284,6 +329,7 @@ def build(c, tools=None, platforms=None, force_image_rebuild=False):
                 f"-v {Path.cwd()}/deploy:/deploy "
                 f"-v $(pwd)/{platform_dir}:/workspace "
                 f"-w /workspace "
+                f"-e PLATFORM={platform} "
                 f"{image_name} "
                 f"/workspace/build_{tool}.sh",
                 pty=True,
@@ -291,6 +337,23 @@ def build(c, tools=None, platforms=None, force_image_rebuild=False):
             )
 
             print(f"\n{tool} build complete for {platform}!")
+
+            # Collect dependencies
+            print(f"\n{'-' * 70}")
+            print(f"Collecting dependencies for {tool} on {platform}...")
+            print(f"{'-' * 70}\n")
+
+            c.run(
+                f"docker run --rm "
+                f"-v {Path.cwd()}/deploy:/deploy "
+                f"-v {Path.cwd()}/{platform_dir}:/workspace "
+                f"-w /workspace "
+                f"-e PLATFORM={platform} "
+                f"{image_name} "
+                f"/workspace/collect_dependencies.sh",
+                pty=True,
+                echo=True,
+            )
 
 
 @task(
@@ -337,7 +400,7 @@ def test(c, tools=None, platforms=None, force_image_rebuild=False):
 
         # Build Docker image for this platform
         image_name = build_docker_image_for_platform(
-            c, platform, TEST_DIR, force_image_rebuild
+            c, platform, TEST_DIR, force_image_rebuild, image_prefix="tester"
         )
 
         for tool in tool_list:
@@ -346,11 +409,12 @@ def test(c, tools=None, platforms=None, force_image_rebuild=False):
             print(f"{'-' * 70}\n")
 
             # Run tests in Docker container
-            platform_dir = Path(TEST_DIR) / platform
+            platform_dir = TEST_DIR / platform
             c.run(
                 f"docker run --rm "
                 f"-v {Path.cwd()}/tool_repos:/tool_repos "
                 f"-v {Path.cwd()}/deploy:/deploy "
+                f"-v {Path.cwd()}/dist/latest:/dist "
                 f"-v $(pwd)/{platform_dir}:/workspace "
                 f"-w /workspace "
                 f"{image_name} "
@@ -421,19 +485,27 @@ def debug_build(c, platform=None, force_image_rebuild=False):
     )
 
     # Launch interactive shell in Docker container
-    platform_dir = Path(BUILD_DIR) / platform
+    platform_dir = BUILD_DIR / platform
     cwd = Path.cwd()
 
     # Build docker command as list for exec
     docker_cmd = [
-        "docker", "run", "--rm", "-it",
-        "-v", "build-cache:/cache",
-        "-v", f"{cwd}/tool_repos:/tool_repos",
-        "-v", f"{cwd}/deploy:/deploy",
-        "-v", f"{cwd}/{platform_dir}:/workspace",
-        "-w", "/workspace",
+        "docker",
+        "run",
+        "--rm",
+        "-it",
+        "-v",
+        "build-cache:/cache",
+        "-v",
+        f"{cwd}/tool_repos:/tool_repos",
+        "-v",
+        f"{cwd}/deploy:/deploy",
+        "-v",
+        f"{cwd}/{platform_dir}:/workspace",
+        "-w",
+        "/workspace",
         image_name,
-        "/bin/bash"
+        "/bin/bash",
     ]
 
     print(f"Executing: {' '.join(docker_cmd)}")
@@ -497,7 +569,7 @@ def debug_test(c, platform=None, force_image_rebuild=False):
 
     # Build Docker image for this platform
     image_name = build_docker_image_for_platform(
-        c, platform, TEST_DIR, force_image_rebuild
+        c, platform, TEST_DIR, force_image_rebuild, image_prefix="tester"
     )
 
     # Launch interactive shell in Docker container
@@ -506,13 +578,22 @@ def debug_test(c, platform=None, force_image_rebuild=False):
 
     # Build docker command as list for exec
     docker_cmd = [
-        "docker", "run", "--rm", "-it",
-        "-v", f"{cwd}/tool_repos:/tool_repos",
-        "-v", f"{cwd}/deploy:/deploy",
-        "-v", f"{cwd}/{platform_dir}:/workspace",
-        "-w", "/workspace",
+        "docker",
+        "run",
+        "--rm",
+        "-it",
+        "-v",
+        f"{cwd}/dist/latest:/dist",
+        "-v",
+        f"{cwd}/tool_repos:/tool_repos",
+        "-v",
+        f"{cwd}/deploy:/deploy",
+        "-v",
+        f"{cwd}/{platform_dir}:/workspace",
+        "-w",
+        "/workspace",
         image_name,
-        "/bin/bash"
+        "/bin/bash",
     ]
 
     print(f"Executing: {' '.join(docker_cmd)}")
@@ -549,9 +630,17 @@ def clean_docker(c, platforms=None):
     platform_list = platforms.split(",")
 
     for platform in platform_list:
-        image_name = f"builder-{platform.strip().lower()}"
-        print(f"Removing Docker image: {image_name}")
-        c.run(f"docker rmi {image_name}", warn=True)
+        platform = platform.strip()
+
+        # Remove builder image
+        builder_image = f"builder-{platform.lower()}"
+        print(f"Removing Docker image: {builder_image}")
+        c.run(f"docker rmi {builder_image}", warn=True)
+
+        # Remove tester image
+        tester_image = f"tester-{platform.lower()}"
+        print(f"Removing Docker image: {tester_image}")
+        c.run(f"docker rmi {tester_image}", warn=True)
 
 
 @task
@@ -591,4 +680,122 @@ def list_tools(c):
             print(f"  {platform}: {', '.join(tools)}")
         else:
             print(f"  {platform}: (no test scripts found)")
+    print()
+
+
+@task
+def create_dist(c):
+    """Create distributable package from deploy/ directory"""
+
+    # Read version from pyproject.toml
+    version = None
+    pyproject_path = Path("pyproject.toml")
+    if pyproject_path.exists():
+        with pyproject_path.open() as f:
+            for line in f:
+                if line.strip().startswith("version"):
+                    version = line.split("=")[1].strip().strip('"').strip("'")
+                    break
+
+    if not version:
+        print("Error: Could not find version in pyproject.toml")
+        return
+
+    print(f"Creating distribution for version {version}...")
+
+    dist_dir = Path(f"dist/ee-linux-tools_v{version}")
+    dist_bin = dist_dir / "bin"
+
+    # Create dist directory structure
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    dist_bin.mkdir(exist_ok=True)
+
+    # Copy all platform builds from deploy/
+    deploy_dir = Path("deploy")
+    if not deploy_dir.exists():
+        print(f"Error: {deploy_dir} directory not found!")
+        print("Please run 'invoke build' first to create deployable builds.")
+        return
+
+    platform_count = 0
+    for platform_dir in deploy_dir.iterdir():
+        if platform_dir.is_dir():
+            platform_name = platform_dir.name
+            dest_platform = dist_dir / platform_name
+
+            print(f"  Copying platform: {platform_name}")
+            # Copy entire platform directory
+            shutil.copytree(platform_dir, dest_platform, dirs_exist_ok=True)
+
+            # Copy detect_platform.sh from build/{platform}/
+            # Find matching build directory by checking PLATFORM env var in Dockerfile
+            detect_found = False
+            for build_platform in Path("build").iterdir():
+                if build_platform.is_dir():
+                    dockerfile = build_platform / "Dockerfile"
+                    if dockerfile.exists():
+                        with dockerfile.open() as f:
+                            content = f.read()
+                            # Look for ENV PLATFORM="..." in Dockerfile
+                            match = re.search(
+                                r'ENV\s+PLATFORM\s*=\s*["\']?([^"\'\s]+)["\']?', content
+                            )
+                            if match and match.group(1) == platform_name:
+                                detect_script = build_platform / "detect_platform.sh"
+                                if detect_script.exists():
+                                    shutil.copy(
+                                        detect_script,
+                                        dest_platform / "detect_platform.sh",
+                                    )
+                                    print(
+                                        f"    Copied detect_platform.sh from {build_platform.name}"
+                                    )
+                                    detect_found = True
+                                    break
+
+            if not detect_found:
+                print(
+                    f"    Warning: Could not find detect_platform.sh for platform {platform_name}"
+                )
+
+            platform_count += 1
+
+    if platform_count == 0:
+        print(f"Error: No platform directories found in {deploy_dir}/")
+        print("Please run 'invoke build' first to create deployable builds.")
+        return
+
+    # Read executables.yaml and generate wrappers
+    executables_file = Path("executables.yaml")
+    if not executables_file.exists():
+        print(f"Error: {executables_file} not found!")
+        return
+
+    with executables_file.open() as f:
+        executables = yaml.safe_load(f)
+
+    if not executables:
+        print("Warning: No executables defined in executables.yaml")
+        return
+
+    print(f"\nGenerating wrapper scripts for {len(executables)} executable(s)...")
+    for exe_path in executables:
+        exe_name = Path(exe_path).name
+        wrapper_path = dist_bin / exe_name
+
+        # Generate wrapper script
+        wrapper_content = generate_wrapper_script(exe_name)
+        wrapper_path.write_text(wrapper_content)
+        wrapper_path.chmod(0o755)
+        print(f"  Created wrapper: bin/{exe_name}")
+
+    print(f"\n{'=' * 70}")
+    print(f"Distribution created successfully!")
+    print(f"{'=' * 70}")
+    print(f"Location: {dist_dir}")
+    print(f"Platforms: {platform_count}")
+    print(f"Executables: {len(executables)}")
+    print(f"\nTo package for distribution:")
+    print(f"  cd dist")
+    print(f"  tar czf ee-linux-tools_v{version}.tar.gz ee-linux-tools_v{version}/")
     print()

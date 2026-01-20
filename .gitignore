@@ -1,8 +1,8 @@
 # Byte-compiled / optimized / DLL files
-external/
 deploy/
 .venv/
 tool_repos/
+dist/
 
 __pycache__/
 *.py[codz]
