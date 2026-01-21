@@ -1,7 +1,7 @@
 # GLIBC 2.27
 FROM ubuntu:18.04
 
-ENV PLATFORM="ubuntu18.04"
+ENV PLATFORM="ubuntu_v18.04"
 
 RUN apt-get update && apt-get install -y \
     build-essential \

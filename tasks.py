@@ -7,11 +7,12 @@ import os
 import re
 import shutil
 import subprocess
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
-from invoke import task
+from invoke import Context, task
 
 tasks_file_path = Path(__file__).resolve().parent
 print(f"Changing directory to {tasks_file_path}")
@@ -23,7 +24,7 @@ TEST_DIR = Path("test")
 DIST_DIR = Path("dist")
 
 
-def generate_wrapper_script(exe_name):
+def generate_wrapper_script(exe_name: str) -> str:
     """Generate platform-detection wrapper script"""
     return f"""#!/bin/bash
 
@@ -44,7 +45,7 @@ for platform_dir in "$DIST_ROOT"/*; do
         # Source the detect script to check if it matches
         if (cd "$platform_dir" && source detect_platform.sh); then
             # Platform match found!
-            export LD_LIBRARY_PATH="$platform_dir/lib:$LD_LIBRARY_PATH"
+            export LD_LIBRARY_PATH="/lib64:$platform_dir/lib:$LD_LIBRARY_PATH"
             exec "$platform_dir/bin/{exe_name}" "$@"
         fi
     fi
@@ -61,11 +62,11 @@ exit 1
 
 
 @task
-def create_cache_volume(c):
+def create_cache_volume(c: Context) -> None:
     c.run("docker volume create build-cache")
 
 
-def get_docker_image_creation_time(c, image_name):
+def get_docker_image_creation_time(c: Context, image_name: str) -> datetime | None:
     """Get the creation timestamp of a Docker image"""
     result = c.run(
         f"docker image inspect {image_name} --format='{{{{.Created}}}}'",
@@ -77,7 +78,7 @@ def get_docker_image_creation_time(c, image_name):
     return None
 
 
-def get_file_modification_time(filepath):
+def get_file_modification_time(filepath: str | Path) -> datetime | None:
     """Get the modification timestamp of a file"""
     path = Path(filepath)
     if path.exists():
@@ -85,7 +86,9 @@ def get_file_modification_time(filepath):
     return None
 
 
-def should_rebuild_docker_image(c, image_name, dockerfile_path, force=False):
+def should_rebuild_docker_image(
+    c: Context, image_name: str, dockerfile_path: str | Path, force: bool = False
+) -> bool:
     """Determine if Docker image needs to be rebuilt (make-like behavior)"""
     if force:
         print(f"Force rebuild requested for '{image_name}'")
@@ -127,7 +130,9 @@ def get_available_platforms(base_dir: Path) -> list[str]:
     return [d.name for d in base_path.iterdir() if d.is_dir()]
 
 
-def get_tools_for_platform(platform, base_dir, script_prefix):
+def get_tools_for_platform(
+    platform: str, base_dir: str | Path, script_prefix: str
+) -> list[str]:
     """Get list of available tools for a platform by scanning for build/test scripts"""
     platform_dir = Path(base_dir) / platform
     if not platform_dir.exists():
@@ -144,7 +149,9 @@ def get_tools_for_platform(platform, base_dir, script_prefix):
     return sorted(tools)
 
 
-def validate_tools(tools_str, platform, base_dir, script_prefix):
+def validate_tools(
+    tools_str: str | None, platform: str, base_dir: str | Path, script_prefix: str
+) -> list[str] | None:
     """Validate and parse the tools argument for a specific platform"""
     available_tools = get_tools_for_platform(platform, base_dir, script_prefix)
 
@@ -171,7 +178,9 @@ def validate_tools(tools_str, platform, base_dir, script_prefix):
     return tools
 
 
-def validate_platforms(platforms_str, base_dir):
+def validate_platforms(
+    platforms_str: str | None, base_dir: str | Path
+) -> list[str] | None:
     """Validate and parse the platforms argument"""
     if not platforms_str:
         return []
@@ -194,8 +203,12 @@ def validate_platforms(platforms_str, base_dir):
 
 
 def build_docker_image_for_platform(
-    c, platform, base_dir, force=False, image_prefix="builder"
-):
+    c: Context,
+    platform: str,
+    base_dir: str | Path,
+    force: bool = False,
+    image_prefix: str = "builder",
+) -> str:
     """Build Docker image for a specific platform if needed"""
     platform_dir = Path(base_dir) / platform
     dockerfile_path = platform_dir / "Dockerfile"
@@ -215,7 +228,7 @@ def build_docker_image_for_platform(
 
 
 @task
-def update_repos(c):
+def update_repos(c: Context) -> None:
     """Clone or update tool repositories from tool_repos.yaml"""
     repos_dir = Path("tool_repos")
     repos_file = Path("tool_repos.yaml")
@@ -274,7 +287,12 @@ def update_repos(c):
         "force_image_rebuild": "Force rebuild of Docker images",
     },
 )
-def build(c, tools=None, platforms=None, force_image_rebuild=False):
+def build(
+    c: Context,
+    tools: str | None = None,
+    platforms: str | None = None,
+    force_image_rebuild: bool = False,
+) -> None:
     """Build specified tools for specified platforms"""
 
     # Get platforms - default to all if not specified
@@ -363,7 +381,12 @@ def build(c, tools=None, platforms=None, force_image_rebuild=False):
         "force_image_rebuild": "Force rebuild of Docker images",
     }
 )
-def test(c, tools=None, platforms=None, force_image_rebuild=False):
+def test(
+    c: Context,
+    tools: str | None = None,
+    platforms: str | None = None,
+    force_image_rebuild: bool = False,
+) -> None:
     """Run tests for specified tools on specified platforms"""
 
     # Get platforms - default to all if not specified
@@ -432,7 +455,9 @@ def test(c, tools=None, platforms=None, force_image_rebuild=False):
         "force_image_rebuild": "Force rebuild of Docker image",
     }
 )
-def debug_build(c, platform=None, force_image_rebuild=False):
+def debug_build(
+    c: Context, platform: str | None = None, force_image_rebuild: bool = False
+) -> None:
     """Launch interactive debug session for a build platform"""
 
     # If platform not provided, prompt user to choose
@@ -520,7 +545,9 @@ def debug_build(c, platform=None, force_image_rebuild=False):
         "force_image_rebuild": "Force rebuild of Docker image",
     }
 )
-def debug_test(c, platform=None, force_image_rebuild=False):
+def debug_test(
+    c: Context, platform: str | None = None, force_image_rebuild: bool = False
+) -> None:
     """Launch interactive debug session for a test platform"""
 
     # If platform not provided, prompt user to choose
@@ -603,7 +630,7 @@ def debug_test(c, platform=None, force_image_rebuild=False):
 
 
 @task
-def clean(c):
+def clean(c: Context) -> None:
     """Clean build artifacts from all platform directories"""
     print("Cleaning build artifacts...")
 
@@ -618,7 +645,7 @@ def clean(c):
 
 
 @task(help={"platforms": "Comma-separated list of platforms to remove images for"})
-def clean_docker(c, platforms=None):
+def clean_docker(c: Context, platforms: str | None = None) -> None:
     """Remove Docker images for specified platforms"""
     if not platforms:
         # Clean all platform images
@@ -644,7 +671,7 @@ def clean_docker(c, platforms=None):
 
 
 @task
-def list_platforms(c):
+def list_platforms(c: Context) -> None:
     """List all available platforms"""
     build_platforms = get_available_platforms(BUILD_DIR)
     test_platforms = get_available_platforms(TEST_DIR)
@@ -661,7 +688,7 @@ def list_platforms(c):
 
 
 @task
-def list_tools(c):
+def list_tools(c: Context) -> None:
     """List all available tools per platform"""
     print("\n=== Available Tools ===\n")
 
@@ -684,19 +711,19 @@ def list_tools(c):
 
 
 @task
-def create_dist(c):
+def create_dist(c: Context) -> None:
     """Create distributable package from deploy/ directory"""
 
     # Read version from pyproject.toml
-    version = None
     pyproject_path = Path("pyproject.toml")
-    if pyproject_path.exists():
-        with pyproject_path.open() as f:
-            for line in f:
-                if line.strip().startswith("version"):
-                    version = line.split("=")[1].strip().strip('"').strip("'")
-                    break
+    if not pyproject_path.exists():
+        print("Error: pyproject.toml not found!")
+        return
 
+    with pyproject_path.open("rb") as f:
+        pyproject_data = tomllib.load(f)
+
+    version = pyproject_data.get("project", {}).get("version")
     if not version:
         print("Error: Could not find version in pyproject.toml")
         return
