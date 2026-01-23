@@ -4,6 +4,10 @@ deploy/
 tool_repos/
 dist/
 
+# Build artifacts in platform directories
+build/*/cmake-*
+build/*/*.tar.gz
+
 __pycache__/
 *.py[codz]
 *$py.class

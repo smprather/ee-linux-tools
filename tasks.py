@@ -19,9 +19,11 @@ print(f"Changing directory to {tasks_file_path}")
 os.chdir(tasks_file_path)
 
 # Configuration
-BUILD_DIR = Path("build")
-TEST_DIR = Path("test")
-DIST_DIR = Path("dist")
+BUILD_DIR = Path("build").resolve()
+TEST_DIR = Path("test").resolve()
+DIST_DIR = Path("dist").resolve()
+TOOL_REPOS_DIR = Path("tool_repos").resolve()
+DEPLOY_DIR = Path("deploy").resolve()
 
 
 def generate_wrapper_script(exe_name: str) -> str:
@@ -73,9 +75,14 @@ def get_docker_image_creation_time(c: Context, image_name: str) -> datetime | No
         hide=True,
         warn=True,
     )
-    if result.ok:
-        return datetime.fromisoformat(result.stdout.strip().replace("Z", "+00:00"))
-    return None
+
+    if result is not None:
+        if result.ok:
+            return datetime.fromisoformat(result.stdout.strip().replace("Z", "+00:00"))
+        else:
+            return None
+    else:
+        raise Exception("Internal Error")
 
 
 def get_file_modification_time(filepath: str | Path) -> datetime | None:
@@ -83,7 +90,8 @@ def get_file_modification_time(filepath: str | Path) -> datetime | None:
     path = Path(filepath)
     if path.exists():
         return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    return None
+    else:
+        return None
 
 
 def should_rebuild_docker_image(
@@ -111,6 +119,9 @@ def should_rebuild_docker_image(
     # Get Dockerfile modification time
     dockerfile_time = get_file_modification_time(dockerfile_path)
 
+    if dockerfile_time is None:
+        raise Exception(f"Error: Cannot read '{Path.cwd()}/Dockerfile'")
+
     # If Dockerfile is newer than image, rebuild
     if dockerfile_time > image_time:
         print(f"Dockerfile modified at {dockerfile_time}")
@@ -124,10 +135,9 @@ def should_rebuild_docker_image(
 
 def get_available_platforms(base_dir: Path) -> list[str]:
     """Get list of available platform directories"""
-    base_path = Path(base_dir)
-    if not base_path.exists():
+    if not base_dir.exists():
         return []
-    return [d.name for d in base_path.iterdir() if d.is_dir()]
+    return [d.name for d in base_dir.iterdir() if d.is_dir()]
 
 
 def get_tools_for_platform(
@@ -179,7 +189,8 @@ def validate_tools(
 
 
 def validate_platforms(
-    platforms_str: str | None, base_dir: str | Path
+    platforms_str: str | None,
+    base_dir: Path,
 ) -> list[str] | None:
     """Validate and parse the platforms argument"""
     if not platforms_str:
@@ -205,12 +216,12 @@ def validate_platforms(
 def build_docker_image_for_platform(
     c: Context,
     platform: str,
-    base_dir: str | Path,
+    base_dir: Path,
+    image_prefix: str,
     force: bool = False,
-    image_prefix: str = "builder",
 ) -> str:
     """Build Docker image for a specific platform if needed"""
-    platform_dir = Path(base_dir) / platform
+    platform_dir = base_dir / platform
     dockerfile_path = platform_dir / "Dockerfile"
     image_name = f"{image_prefix}-{platform.lower()}"
 
@@ -224,13 +235,34 @@ def build_docker_image_for_platform(
         )
         print(f"Docker image '{image_name}' build complete!\n")
 
+        c.run(
+            f"docker run --rm "
+            "-v build-cache:/cache "
+            f"{image_name} "
+            "/bin/mkdir -p /cache/go /cache/cargo /cache/cmake /cache/npm /cache/uv /cache/ccache",
+            pty=True,
+            echo=True,
+        )
+
+        post_build_script = platform_dir / "post_image_build.sh"
+        if post_build_script.exists():
+            c.run(
+                "docker run --rm "
+                "-v build-cache:/cache "
+                f"-v {platform_dir}:/workspace "
+                "-w /workspace "
+                f"{image_name} "
+                f"./{post_build_script.name}",
+                pty=True,
+                echo=True,
+            )
+
     return image_name
 
 
 @task
 def update_repos(c: Context) -> None:
     """Clone or update tool repositories from tool_repos.yaml"""
-    repos_dir = Path("tool_repos")
     repos_file = Path("tool_repos.yaml")
 
     # Check if tool_repos.yaml exists
@@ -239,8 +271,8 @@ def update_repos(c: Context) -> None:
         return
 
     # Create tool_repos directory if it doesn't exist
-    repos_dir.mkdir(exist_ok=True)
-    print(f"Using repository directory: {repos_dir.absolute()}")
+    TOOL_REPOS_DIR.mkdir(exist_ok=True)
+    print(f"Using repository directory: {TOOL_REPOS_DIR}")
 
     # Read tool_repos.yaml
     with repos_file.open() as f:
@@ -261,7 +293,7 @@ def update_repos(c: Context) -> None:
             print(f"Warning: No URL specified for {tool_name}, skipping")
             continue
 
-        tool_path = repos_dir / tool_name
+        tool_path = TOOL_REPOS_DIR / tool_name
 
         if tool_path.exists():
             print(f"{'-' * 70}")
@@ -329,7 +361,11 @@ def build(
 
         # Build Docker image for this platform
         image_name = build_docker_image_for_platform(
-            c, platform, BUILD_DIR, force_image_rebuild
+            c,
+            platform,
+            BUILD_DIR,
+            "builder",
+            force_image_rebuild,
         )
 
         for tool in tool_list:
@@ -343,9 +379,9 @@ def build(
                 f"docker run --rm "
                 f"--cpus {subprocess.getoutput('cat /proc/cpuinfo | grep -c Processor')} "
                 "-v build-cache:/cache "
-                f"-v {Path.cwd()}/tool_repos:/tool_repos "
-                f"-v {Path.cwd()}/deploy:/deploy "
-                f"-v $(pwd)/{platform_dir}:/workspace "
+                f"-v {TOOL_REPOS_DIR}:/tool_repos "
+                f"-v {DEPLOY_DIR}:/deploy "
+                f"-v {platform_dir}:/workspace "
                 f"-w /workspace "
                 f"-e PLATFORM={platform} "
                 f"{image_name} "
@@ -363,12 +399,11 @@ def build(
 
             c.run(
                 f"docker run --rm "
-                f"-v {Path.cwd()}/deploy:/deploy "
-                f"-v {Path.cwd()}/{platform_dir}:/workspace "
+                f"-v {DEPLOY_DIR}:/deploy "
+                f"-v {platform_dir}:/workspace "
                 f"-w /workspace "
-                f"-e PLATFORM={platform} "
                 f"{image_name} "
-                f"/workspace/collect_dependencies.sh",
+                f"./collect_dependencies.sh",
                 pty=True,
                 echo=True,
             )
@@ -423,7 +458,11 @@ def test(
 
         # Build Docker image for this platform
         image_name = build_docker_image_for_platform(
-            c, platform, TEST_DIR, force_image_rebuild, image_prefix="tester"
+            c,
+            platform,
+            TEST_DIR,
+            image_prefix="tester",
+            force=force_image_rebuild,
         )
 
         for tool in tool_list:
@@ -435,13 +474,13 @@ def test(
             platform_dir = TEST_DIR / platform
             c.run(
                 f"docker run --rm "
-                f"-v {Path.cwd()}/tool_repos:/tool_repos "
-                f"-v {Path.cwd()}/deploy:/deploy "
-                f"-v {Path.cwd()}/dist/latest:/dist "
-                f"-v $(pwd)/{platform_dir}:/workspace "
+                f"-v {TOOL_REPOS_DIR}:/tool_repos "
+                f"-v {DEPLOY_DIR}:/deploy "
+                f"-v {platform_dir}:/workspace "
+                f"-v {DIST_DIR}/latest:/dist "
                 f"-w /workspace "
                 f"{image_name} "
-                f"/workspace/test_{tool}.sh",
+                f"./test_{tool}.sh",
                 pty=True,
                 echo=True,
             )
@@ -506,7 +545,11 @@ def debug_build(
 
     # Build Docker image for this platform
     image_name = build_docker_image_for_platform(
-        c, platform, BUILD_DIR, force_image_rebuild
+        c,
+        platform,
+        BUILD_DIR,
+        image_prefix="builder",
+        force=force_image_rebuild,
     )
 
     # Launch interactive shell in Docker container
@@ -596,7 +639,11 @@ def debug_test(
 
     # Build Docker image for this platform
     image_name = build_docker_image_for_platform(
-        c, platform, TEST_DIR, force_image_rebuild, image_prefix="tester"
+        c,
+        platform,
+        TEST_DIR,
+        image_prefix="tester",
+        force=force_image_rebuild,
     )
 
     # Launch interactive shell in Docker container
@@ -817,12 +864,12 @@ def create_dist(c: Context) -> None:
         print(f"  Created wrapper: bin/{exe_name}")
 
     print(f"\n{'=' * 70}")
-    print(f"Distribution created successfully!")
+    print("Distribution created successfully!")
     print(f"{'=' * 70}")
     print(f"Location: {dist_dir}")
     print(f"Platforms: {platform_count}")
     print(f"Executables: {len(executables)}")
-    print(f"\nTo package for distribution:")
-    print(f"  cd dist")
+    print("\nTo package for distribution:")
+    print("  cd dist")
     print(f"  tar czf ee-linux-tools_v{version}.tar.gz ee-linux-tools_v{version}/")
     print()

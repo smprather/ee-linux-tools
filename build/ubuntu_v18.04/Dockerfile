@@ -1,9 +1,12 @@
 # GLIBC 2.27
 FROM ubuntu:18.04
 
+WORKDIR /workspace
+
 ENV PLATFORM="ubuntu_v18.04"
 
 RUN apt-get update && apt-get install -y \
+    coreutils \
     build-essential \
     curl \
     gettext \
@@ -15,22 +18,8 @@ RUN apt-get update && apt-get install -y \
     wget \
     libssl-dev \
     ccache \
+    tree \
     git
-
-# Build cmake
-RUN <<EOF
-    version=4.2
-    build=1
-    cd /tmp
-    wget https://cmake.org/files/v$version/cmake-$version.$build.tar.gz
-    tar -xzvf cmake-$version.$build.tar.gz
-    cd cmake-$version.$build
-    ./bootstrap
-    make
-    make install
-    cd ..
-    rm -fr cmake-$version.$build
-EOF
 
 # Install rustc/rustup
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain nightly -y
@@ -42,20 +31,12 @@ ENV RUSTUP_HOME=/root/.rustup
 RUN curl -L https://go.dev/dl/go1.21.5.linux-amd64.tar.gz | tar -C /usr/local -xzf -
 ENV PATH="/usr/local/go/bin:${PATH}"
 
-# Install Python and uv
+# Install uv and Python
 ENV UV_PYTHON="cpython-3.14.2-linux-x86_64-gnu"
 ENV UV_CACHE_DIR="/cache/uv"
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 RUN uv python install
-
-# Create cache directories
-RUN mkdir -p /cache/go \
-    /cache/cargo \
-    /cache/cmake \
-    /cache/npm \
-    /cache/uv \
-    /cache/ccache
 
 # Go cache
 ENV GOCACHE=/cache/go/build
@@ -72,6 +53,8 @@ ENV CCACHE_BASEDIR="/root"
 
 # Clean up apt stuff that's not needed in the image
 RUN rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/workspace/cmake-4.2.1/bin:$PATH"
 
 CMD ["/bin/bash"]
 

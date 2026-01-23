@@ -1,3 +1,7 @@
 neovim:
   url: https://github.com/neovim/neovim.git
   branch: master
+myles_dotfiles:
+  url: https://github.com/smprather/dotfiles.git
+  branch: main
+
