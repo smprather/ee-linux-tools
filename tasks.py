@@ -28,6 +28,29 @@ DEPLOY_DIR = Path("deploy").resolve()
 
 def generate_wrapper_script(exe_name: str) -> str:
     """Generate platform-detection wrapper script"""
+
+    # Determine if this executable needs XDG support
+    needs_xdg = exe_name == "nvim"
+
+    # Generate XDG directory creation if needed (must run before LD_LIBRARY_PATH is set)
+    xdg_dirs_setup = ""
+    xdg_exports = ""
+    if needs_xdg:
+        xdg_dirs_setup = """
+            # Create XDG directories if they don't exist (before LD_LIBRARY_PATH to avoid glibc conflicts)
+            mkdir -p "$platform_dir/nvim/config/nvim"
+            mkdir -p "$platform_dir/nvim/share"
+            mkdir -p "$platform_dir/nvim/cache"
+            mkdir -p "$platform_dir/nvim/local/state"
+"""
+        xdg_exports = """
+            # Set XDG environment variables for NeoVim configuration
+            export XDG_CONFIG_HOME="$platform_dir/nvim/config"
+            export XDG_DATA_HOME="$platform_dir/nvim/share"
+            export XDG_CACHE_HOME="$platform_dir/nvim/cache"
+            export XDG_STATE_HOME="$platform_dir/nvim/local/state"
+"""
+
     return f"""#!/bin/bash
 
 # Get the directory where this script is located
@@ -47,7 +70,9 @@ for platform_dir in "$DIST_ROOT"/*; do
         # Source the detect script to check if it matches
         if (cd "$platform_dir" && source detect_platform.sh); then
             # Platform match found!
+{xdg_dirs_setup}
             export LD_LIBRARY_PATH="/lib64:$platform_dir/lib:$LD_LIBRARY_PATH"
+{xdg_exports}
             exec "$platform_dir/bin/{exe_name}" "$@"
         fi
     fi
@@ -143,20 +168,62 @@ def get_available_platforms(base_dir: Path) -> list[str]:
 def get_tools_for_platform(
     platform: str, base_dir: str | Path, script_prefix: str
 ) -> list[str]:
-    """Get list of available tools for a platform by scanning for build/test scripts"""
+    """Get list of available tools for a platform by scanning for build/test scripts
+
+    Scripts must be named: {script_prefix}<tool>.<N>.sh where N is a non-negative integer
+    representing the build order. Returns tools sorted by order number.
+    """
     platform_dir = Path(base_dir) / platform
     if not platform_dir.exists():
         return []
 
-    tools = []
-    for script in platform_dir.iterdir():
-        if script.name.startswith(script_prefix) and script.name.endswith(".sh"):
-            # Extract tool name from script filename
-            # e.g., "build_neovim.sh" -> "neovim"
-            tool_name = script.name[len(script_prefix) : -3]
-            tools.append(tool_name)
+    # Pattern: build_<tool>.<N>.sh or test_<tool>.<N>.sh
+    pattern = re.compile(rf"^{re.escape(script_prefix)}(.+)\.(\d+)\.sh$")
 
-    return sorted(tools)
+    tool_order_map = {}
+    for script in platform_dir.iterdir():
+        match = pattern.match(script.name)
+        if match:
+            tool_name = match.group(1)
+            order_num = int(match.group(2))
+
+            # If tool appears multiple times, keep the one with lowest order number
+            if tool_name not in tool_order_map or order_num < tool_order_map[tool_name]:
+                tool_order_map[tool_name] = order_num
+
+    # Sort by order number, then return just the tool names
+    sorted_tools = sorted(tool_order_map.items(), key=lambda x: x[1])
+    return [tool_name for tool_name, _ in sorted_tools]
+
+
+def get_script_path_for_tool(
+    platform: str, base_dir: str | Path, script_prefix: str, tool_name: str
+) -> str | None:
+    """Get the script filename for a specific tool
+
+    Returns the script filename (e.g., 'build_tree-sitter.1.sh') or None if not found
+    """
+    platform_dir = Path(base_dir) / platform
+    if not platform_dir.exists():
+        return None
+
+    # Pattern: build_<tool>.<N>.sh or test_<tool>.<N>.sh
+    pattern = re.compile(rf"^{re.escape(script_prefix)}{re.escape(tool_name)}\.(\d+)\.sh$")
+
+    # Find the script with the lowest order number for this tool
+    matching_scripts = []
+    for script in platform_dir.iterdir():
+        match = pattern.match(script.name)
+        if match:
+            order_num = int(match.group(1))
+            matching_scripts.append((script.name, order_num))
+
+    if not matching_scripts:
+        return None
+
+    # Return the script with the lowest order number
+    matching_scripts.sort(key=lambda x: x[1])
+    return matching_scripts[0][0]
 
 
 def validate_tools(
@@ -315,20 +382,20 @@ def update_repos(c: Context) -> None:
     pre=[create_cache_volume, update_repos],
     help={
         "tools": "Comma-separated list of tools to build (e.g., neovim). Default: all tools for each platform",
-        "platforms": "Comma-separated list of platforms (e.g., GLIBC227,EL7). Default: all platforms",
+        "platform": "Comma-separated list of platforms (e.g., GLIBC227,EL7). Default: all platforms",
         "force_image_rebuild": "Force rebuild of Docker images",
     },
 )
 def build(
     c: Context,
     tools: str | None = None,
-    platforms: str | None = None,
+    platform: str | None = None,
     force_image_rebuild: bool = False,
 ) -> None:
     """Build specified tools for specified platforms"""
 
     # Get platforms - default to all if not specified
-    if not platforms:
+    if not platform:
         platform_list = get_available_platforms(BUILD_DIR)
         if not platform_list:
             print(f"Error: No platform directories found in {BUILD_DIR}/")
@@ -337,7 +404,7 @@ def build(
             f"No platforms specified. Building for all platforms: {', '.join(platform_list)}"
         )
     else:
-        platform_list = validate_platforms(platforms, BUILD_DIR)
+        platform_list = validate_platforms(platform, BUILD_DIR)
         if platform_list is None:
             return
 
@@ -373,6 +440,12 @@ def build(
             print(f"Building {tool} for {platform}...")
             print(f"{'-' * 70}\n")
 
+            # Get the build script filename for this tool
+            build_script = get_script_path_for_tool(platform, BUILD_DIR, "build_", tool)
+            if not build_script:
+                print(f"Error: Build script not found for {tool}")
+                continue
+
             # Run build in Docker container
             platform_dir = BUILD_DIR / platform
             c.run(
@@ -385,7 +458,7 @@ def build(
                 f"-w /workspace "
                 f"-e PLATFORM={platform} "
                 f"{image_name} "
-                f"/workspace/build_{tool}.sh",
+                f"/workspace/{build_script}",
                 pty=True,
                 echo=True,
             )
@@ -412,20 +485,20 @@ def build(
 @task(
     help={
         "tools": "Comma-separated list of tools to test (e.g., neovim). Default: all tools for each platform",
-        "platforms": "Comma-separated list of platforms (e.g., EL7). Default: all platforms",
+        "platform": "Comma-separated list of platforms (e.g., EL7). Default: all platforms",
         "force_image_rebuild": "Force rebuild of Docker images",
     }
 )
 def test(
     c: Context,
     tools: str | None = None,
-    platforms: str | None = None,
+    platform: str | None = None,
     force_image_rebuild: bool = False,
 ) -> None:
     """Run tests for specified tools on specified platforms"""
 
     # Get platforms - default to all if not specified
-    if not platforms:
+    if not platform:
         platform_list = get_available_platforms(TEST_DIR)
         if not platform_list:
             print(f"Error: No platform directories found in {TEST_DIR}/")
@@ -434,7 +507,7 @@ def test(
             f"No platforms specified. Testing on all platforms: {', '.join(platform_list)}"
         )
     else:
-        platform_list = validate_platforms(platforms, TEST_DIR)
+        platform_list = validate_platforms(platform, TEST_DIR)
         if platform_list is None:
             return
 
@@ -470,6 +543,12 @@ def test(
             print(f"Testing {tool} on {platform}...")
             print(f"{'-' * 70}\n")
 
+            # Get the test script filename for this tool
+            test_script = get_script_path_for_tool(platform, TEST_DIR, "test_", tool)
+            if not test_script:
+                print(f"Error: Test script not found for {tool}")
+                continue
+
             # Run tests in Docker container
             platform_dir = TEST_DIR / platform
             c.run(
@@ -480,7 +559,7 @@ def test(
                 f"-v {DIST_DIR}/latest:/dist "
                 f"-w /workspace "
                 f"{image_name} "
-                f"./test_{tool}.sh",
+                f"./{test_script}",
                 pty=True,
                 echo=True,
             )
@@ -554,7 +633,6 @@ def debug_build(
 
     # Launch interactive shell in Docker container
     platform_dir = BUILD_DIR / platform
-    cwd = Path.cwd()
 
     # Build docker command as list for exec
     docker_cmd = [
@@ -565,11 +643,11 @@ def debug_build(
         "-v",
         "build-cache:/cache",
         "-v",
-        f"{cwd}/tool_repos:/tool_repos",
+        f"{TOOL_REPOS_DIR}:/tool_repos",
         "-v",
-        f"{cwd}/deploy:/deploy",
+        f"{DEPLOY_DIR}:/deploy",
         "-v",
-        f"{cwd}/{platform_dir}:/workspace",
+        f"{platform_dir}:/workspace",
         "-w",
         "/workspace",
         image_name,
@@ -648,7 +726,6 @@ def debug_test(
 
     # Launch interactive shell in Docker container
     platform_dir = Path(TEST_DIR) / platform
-    cwd = Path.cwd()
 
     # Build docker command as list for exec
     docker_cmd = [
@@ -657,13 +734,13 @@ def debug_test(
         "--rm",
         "-it",
         "-v",
-        f"{cwd}/dist/latest:/dist",
+        f"{DIST_DIR}/latest:/dist",
         "-v",
-        f"{cwd}/tool_repos:/tool_repos",
+        f"{TOOL_REPOS_DIR}:/tool_repos",
         "-v",
-        f"{cwd}/deploy:/deploy",
+        f"{DEPLOY_DIR}:/deploy",
         "-v",
-        f"{cwd}/{platform_dir}:/workspace",
+        f"{platform_dir}:/workspace",
         "-w",
         "/workspace",
         image_name,
@@ -691,17 +768,17 @@ def clean(c: Context) -> None:
     print("Clean complete!")
 
 
-@task(help={"platforms": "Comma-separated list of platforms to remove images for"})
-def clean_docker(c: Context, platforms: str | None = None) -> None:
+@task(help={"platform": "Comma-separated list of platforms to remove images for"})
+def clean_docker(c: Context, platform: str | None = None) -> None:
     """Remove Docker images for specified platforms"""
-    if not platforms:
+    if not platform:
         # Clean all platform images
         all_platforms = set(
             get_available_platforms(BUILD_DIR) + get_available_platforms(TEST_DIR)
         )
         platforms = ",".join(all_platforms)
 
-    platform_list = platforms.split(",")
+    platform_list = platform.split(",")
 
     for platform in platform_list:
         platform = platform.strip()

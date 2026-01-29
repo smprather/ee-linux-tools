@@ -1,3 +1,4 @@
 # These are the executable files relative to the deploy/<platform> directories.
 # Use this list to create the platform detection wrapper scripts.
 - /bin/nvim
+- /bin/tree-sitter

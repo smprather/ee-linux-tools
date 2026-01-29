@@ -4,4 +4,7 @@ neovim:
 myles_dotfiles:
   url: https://github.com/smprather/dotfiles.git
   branch: main
+tree-sitter:
+  url: https://github.com/tree-sitter/tree-sitter.git
+  branch: master
 

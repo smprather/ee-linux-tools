@@ -3,6 +3,9 @@ FROM ubuntu:18.04
 
 WORKDIR /workspace
 
+ENV USER="root"
+ENV HOME="/root"
+
 ENV PLATFORM="ubuntu_v18.04"
 
 RUN apt-get update && apt-get install -y \
@@ -19,13 +22,15 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     ccache \
     tree \
-    git
+    git \
+    libclang-dev \
+    clang
 
 # Install rustc/rustup
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain nightly -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-ENV CARGO_HOME=/root/.cargo
-ENV RUSTUP_HOME=/root/.rustup
+ENV PATH="$HOME/.cargo/bin:${PATH}"
+ENV CARGO_HOME="$HOME/.cargo"
+ENV RUSTUP_HOME="$HOME/.rustup"
 
 # Install Go
 RUN curl -L https://go.dev/dl/go1.21.5.linux-amd64.tar.gz | tar -C /usr/local -xzf -
@@ -35,7 +40,7 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 ENV UV_PYTHON="cpython-3.14.2-linux-x86_64-gnu"
 ENV UV_CACHE_DIR="/cache/uv"
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
+ENV PATH="$HOME/.local/bin:${PATH}"
 RUN uv python install
 
 # Go cache
@@ -49,7 +54,7 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=12
 ENV npm_config_cache=/cache/npm
 # ccache for C/C++ compilation
 ENV CCACHE_DIR=/cache/ccache
-ENV CCACHE_BASEDIR="/root"
+ENV CCACHE_BASEDIR="$HOME"
 
 # Clean up apt stuff that's not needed in the image
 RUN rm -rf /var/lib/apt/lists/*

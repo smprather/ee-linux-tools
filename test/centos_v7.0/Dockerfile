@@ -10,8 +10,27 @@ RUN yum update -y && yum install -y \
     which \
     vim \
     gcc \
+    make \
     openssl \
+    openssl-devel \
+    curl-devel \
+    expat-devel \
+    gettext-devel \
+    zlib-devel \
+    perl-ExtUtils-MakeMaker \
     nscd \
+    curl \
+    wget \
     && yum clean all \
     && rm -rf /var/cache/yum
+
+# Compile and install git from source (2.20.1 is compatible with CentOS 7's GCC 4.8.5)
+RUN cd /tmp \
+    && wget https://mirrors.edge.kernel.org/pub/software/scm/git/git-2.20.1.tar.gz \
+    && tar xzf git-2.20.1.tar.gz \
+    && cd git-2.20.1 \
+    && make prefix=/usr/local all \
+    && make prefix=/usr/local install \
+    && cd / \
+    && rm -rf /tmp/git-*
 
